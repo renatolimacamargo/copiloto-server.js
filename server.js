@@ -5,7 +5,19 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+  origin: true,
+  credentials: true,
+  exposedHeaders: [
+    'Accept-Ranges',
+    'Content-Range',
+    'Content-Length',
+    'Content-Type',
+    'Content-Disposition',
+    'Cache-Control'
+  ]
+}));
 app.use(express.json({ limit: '25mb' }));
 
 // SUPABASE: nesta fase usar SOMENTE contatos
@@ -23,6 +35,7 @@ const BACKEND_PUBLIC_BASE_URL = String(
 
 const CHAT_LIST_LIMIT = Number(process.env.SYNC_CHAT_LIMIT || 5000);
 const MESSAGE_LIMIT_DEFAULT = Number(process.env.SYNC_MESSAGE_LIMIT || 200);
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 20000);
 
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
@@ -146,6 +159,28 @@ function mediaTypeToKeyInfo(messageType, mimetype) {
   return 'WhatsApp Document Keys';
 }
 
+function normalizeServedMimeType(mimetype, messageType) {
+  const value = String(mimetype || '').trim().toLowerCase();
+
+  if (value) {
+    if (value.startsWith('image/')) return value.split(';')[0].trim();
+    if (value.startsWith('video/')) return value.split(';')[0].trim();
+    if (value.startsWith('audio/ogg')) return 'audio/ogg';
+    if (value.startsWith('audio/mp4')) return 'audio/mp4';
+    if (value.startsWith('audio/mpeg')) return 'audio/mpeg';
+    if (value.startsWith('audio/wav')) return 'audio/wav';
+    if (value.startsWith('audio/webm')) return 'audio/webm';
+    return value;
+  }
+
+  if (messageType === 'imageMessage') return 'image/jpeg';
+  if (messageType === 'videoMessage') return 'video/mp4';
+  if (messageType === 'audioMessage') return 'audio/ogg';
+  if (messageType === 'stickerMessage') return 'image/webp';
+
+  return 'application/octet-stream';
+}
+
 function decryptWhatsAppMedia(buffer, mediaKey, messageType, mimetype) {
   const mediaKeyBuffer = Buffer.from(mediaKey, 'base64');
   const info = mediaTypeToKeyInfo(messageType, mimetype);
@@ -160,6 +195,8 @@ function decryptWhatsAppMedia(buffer, mediaKey, messageType, mimetype) {
 
   const iv = expanded.subarray(0, 16);
   const cipherKey = expanded.subarray(16, 48);
+
+  // WhatsApp anexa MAC de 10 bytes no final
   const encrypted = buffer.length > 10 ? buffer.subarray(0, buffer.length - 10) : buffer;
 
   const decipher = crypto.createDecipheriv('aes-256-cbc', cipherKey, iv);
@@ -171,14 +208,14 @@ function decryptWhatsAppMedia(buffer, mediaKey, messageType, mimetype) {
 }
 
 function buildMediaProxyUrl({ messageType, mediaUrl, mediaKey, mimetype, fileName }) {
-  if (!mediaUrl || !mediaKey) return null;
+  if (!mediaUrl) return null;
 
   const params = new URLSearchParams({
     type: messageType || 'documentMessage',
-    url: safeBase64Url(mediaUrl),
-    mediaKey: safeBase64Url(mediaKey)
+    url: safeBase64Url(mediaUrl)
   });
 
+  if (mediaKey) params.set('mediaKey', safeBase64Url(mediaKey));
   if (mimetype) params.set('mimetype', safeBase64Url(mimetype));
   if (fileName) params.set('fileName', safeBase64Url(fileName));
 
@@ -187,7 +224,6 @@ function buildMediaProxyUrl({ messageType, mediaUrl, mediaKey, mimetype, fileNam
 
 function extractMessageText(message) {
   if (!message) return null;
-
   if (typeof message === 'string') return message;
 
   if (message.conversation) return message.conversation;
@@ -322,9 +358,7 @@ function extractMessagePayloadParts(message) {
     return {
       ...base,
       messageType: 'reactionMessage',
-      messageText: message.reactionMessage?.text
-        ? `[reactionMessage:${message.reactionMessage.text}]`
-        : '[reactionMessage]',
+      messageText: null,
       reactionText: message.reactionMessage?.text || null
     };
   }
@@ -353,7 +387,7 @@ function extractMessagePayloadParts(message) {
         mimetype: mimetype || 'image/jpeg',
         fileName,
         caption: node.caption || null,
-        thumbnailUrl: proxyUrl,
+        thumbnailUrl: messageType === 'imageMessage' ? proxyUrl : null,
         fileSize: fileLengthToNumber(node.fileLength)
       };
     }
@@ -367,7 +401,7 @@ function extractMessagePayloadParts(message) {
         mimetype: mimetype || 'video/mp4',
         fileName,
         caption: node.caption || null,
-        thumbnailUrl: proxyUrl,
+        thumbnailUrl: null,
         fileSize: fileLengthToNumber(node.fileLength),
         durationSeconds: node.seconds || null
       };
@@ -650,8 +684,22 @@ function normalizeMessageRecord(record, fallback = {}) {
   };
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function evolutionHttpRequest(method, path, body = undefined) {
-  const response = await fetch(`${EVOLUTION_BASE_URL}${path}`, {
+  const response = await fetchWithTimeout(`${EVOLUTION_BASE_URL}${path}`, {
     method,
     headers: {
       'Content-Type': 'application/json',
@@ -1102,6 +1150,51 @@ async function deleteMessageOnEvolution({ messageId, chatId, fromMe, deleteForEv
   return tryEvolutionCandidates(candidates);
 }
 
+function copySelectedHeaders(sourceHeaders, res) {
+  const headersToCopy = [
+    'content-type',
+    'content-length',
+    'content-range',
+    'accept-ranges',
+    'cache-control',
+    'etag',
+    'last-modified'
+  ];
+
+  for (const header of headersToCopy) {
+    const value = sourceHeaders.get(header);
+    if (value) {
+      res.setHeader(header, value);
+    }
+  }
+}
+
+function parseRangeHeader(rangeHeader, totalLength) {
+  if (!rangeHeader || !String(rangeHeader).startsWith('bytes=')) return null;
+
+  const raw = String(rangeHeader).replace('bytes=', '').trim();
+  const [startStr, endStr] = raw.split('-');
+
+  let start = startStr === '' ? NaN : Number(startStr);
+  let end = endStr === '' ? NaN : Number(endStr);
+
+  if (Number.isNaN(start) && Number.isNaN(end)) return null;
+
+  if (Number.isNaN(start)) {
+    const suffixLength = end;
+    if (Number.isNaN(suffixLength) || suffixLength <= 0) return null;
+    start = Math.max(totalLength - suffixLength, 0);
+    end = totalLength - 1;
+  } else {
+    if (start < 0 || start >= totalLength) return null;
+    if (Number.isNaN(end) || end >= totalLength) end = totalLength - 1;
+  }
+
+  if (end < start) return null;
+
+  return { start, end };
+}
+
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
@@ -1224,18 +1317,74 @@ app.get('/api/media', async (req, res) => {
     const encodedMimetype = String(req.query.mimetype || '');
     const encodedFileName = String(req.query.fileName || '');
 
-    if (!encodedUrl || !encodedMediaKey) {
-      return res.status(400).json({ ok: false, error: 'url_and_mediaKey_required' });
+    if (!encodedUrl) {
+      return res.status(400).json({ ok: false, error: 'url_required' });
     }
 
     const mediaUrl = fromSafeBase64Url(encodedUrl);
-    const mediaKey = fromSafeBase64Url(encodedMediaKey);
-    const mimetype = encodedMimetype ? fromSafeBase64Url(encodedMimetype) : 'application/octet-stream';
+    const mediaKey = encodedMediaKey ? fromSafeBase64Url(encodedMediaKey) : null;
+    const rawMimetype = encodedMimetype ? fromSafeBase64Url(encodedMimetype) : '';
+    const servedMimetype = normalizeServedMimeType(rawMimetype, type);
     const fileName = encodedFileName ? fromSafeBase64Url(encodedFileName) : null;
 
-    const response = await fetch(mediaUrl, {
+    if (!mediaKey) {
+      const upstreamHeaders = {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': '*/*'
+      };
+
+      if (req.headers.range) {
+        upstreamHeaders.Range = String(req.headers.range);
+      }
+
+      const upstreamResponse = await fetchWithTimeout(mediaUrl, {
+        headers: upstreamHeaders
+      });
+
+      if (!upstreamResponse.ok && upstreamResponse.status !== 206) {
+        return res.status(upstreamResponse.status).json({
+          ok: false,
+          error: 'media_passthrough_failed',
+          status: upstreamResponse.status
+        });
+      }
+
+      const upstreamBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
+
+      res.status(upstreamResponse.status);
+      copySelectedHeaders(upstreamResponse.headers, res);
+      res.setHeader('Content-Type', normalizeServedMimeType(
+        upstreamResponse.headers.get('content-type') || servedMimetype,
+        type
+      ));
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
+      if (fileName) {
+        res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+      } else {
+        res.setHeader('Content-Disposition', 'inline');
+      }
+
+      if (!res.getHeader('Cache-Control')) {
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+      }
+
+      if (!res.getHeader('Accept-Ranges')) {
+        res.setHeader('Accept-Ranges', 'bytes');
+      }
+
+      if (!res.getHeader('Content-Length')) {
+        res.setHeader('Content-Length', String(upstreamBuffer.length));
+      }
+
+      return res.send(upstreamBuffer);
+    }
+
+    const response = await fetchWithTimeout(mediaUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0'
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': '*/*'
       }
     });
 
@@ -1249,20 +1398,54 @@ app.get('/api/media', async (req, res) => {
 
     const encryptedBuffer = Buffer.from(await response.arrayBuffer());
 
-    let outputBuffer = encryptedBuffer;
+    let outputBuffer;
     try {
-      outputBuffer = decryptWhatsAppMedia(encryptedBuffer, mediaKey, type, mimetype);
+      outputBuffer = decryptWhatsAppMedia(encryptedBuffer, mediaKey, type, servedMimetype);
     } catch (decryptErr) {
-      console.warn('[media] decrypt falhou, enviando bruto:', decryptErr.message || decryptErr);
+      console.error('[media] decrypt falhou:', {
+        type,
+        mimetype: servedMimetype,
+        encryptedSize: encryptedBuffer.length,
+        message: decryptErr.message || String(decryptErr)
+      });
+
+      return res.status(500).json({
+        ok: false,
+        error: 'media_decrypt_failed',
+        details: decryptErr.message || String(decryptErr)
+      });
     }
 
-    res.setHeader('Content-Type', mimetype || 'application/octet-stream');
+    const totalLength = outputBuffer.length;
+    const rangeHeader = req.headers.range;
+    const range = parseRangeHeader(rangeHeader, totalLength);
+
+    res.setHeader('Content-Type', servedMimetype);
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.setHeader('Content-Length', String(outputBuffer.length));
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
     if (fileName) {
       res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+    } else {
+      res.setHeader('Content-Disposition', 'inline');
     }
 
+    if (rangeHeader && !range) {
+      res.setHeader('Content-Range', `bytes */${totalLength}`);
+      return res.status(416).end();
+    }
+
+    if (range) {
+      const chunk = outputBuffer.subarray(range.start, range.end + 1);
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${totalLength}`);
+      res.setHeader('Content-Length', String(chunk.length));
+      return res.send(chunk);
+    }
+
+    res.setHeader('Content-Length', String(totalLength));
     return res.status(200).send(outputBuffer);
   } catch (err) {
     console.error('Erro geral /api/media:', err);
@@ -1294,7 +1477,7 @@ app.post('/api/send-message', async (req, res) => {
       return res.status(400).json({ error: 'message_required' });
     }
 
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${EVOLUTION_BASE_URL}/message/sendText/${EVOLUTION_INSTANCE}`,
       {
         method: 'POST',

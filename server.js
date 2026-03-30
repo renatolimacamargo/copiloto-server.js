@@ -582,15 +582,24 @@ function normalizeChatRecord(chat) {
     ? (isGroupJid(rawRemoteJid) ? rawRemoteJid : altRemoteJid || rawRemoteJid)
     : pickBestDirectJid(rawRemoteJid, altRemoteJid);
 
-  const externalChatId = getPreferredExternalChatId({
+  let externalChatId = getPreferredExternalChatId({
     primaryJid: rawRemoteJid,
     altJid: altRemoteJid,
     isGroup
   });
 
+  if (!isGroup) {
+    externalChatId =
+      normalizePhone(externalChatId) ||
+      normalizePhone(preferredJid) ||
+      normalizePhone(rawRemoteJid) ||
+      normalizePhone(altRemoteJid) ||
+      null;
+  }
+
   const stableChatKey = isGroup
     ? (preferredJid || rawRemoteJid || altRemoteJid || null)
-    : (externalChatId || normalizePhone(preferredJid) || normalizePhone(rawRemoteJid) || normalizePhone(altRemoteJid) || null);
+    : externalChatId;
 
   return {
     raw: chat,
@@ -616,7 +625,6 @@ function normalizeChatRecord(chat) {
       null
   };
 }
-
 function normalizeMessageRecord(record, fallback = {}) {
   const key = record?.key || {};
 
@@ -802,6 +810,7 @@ function findChatMatch(chats, chatId) {
 
   const byExactJid = chats.find(
     (c) =>
+      c.stableChatKey === chatId ||
       c.queryRemoteJid === chatId ||
       c.rawRemoteJid === chatId ||
       c.remoteJid === chatId ||
@@ -812,12 +821,13 @@ function findChatMatch(chats, chatId) {
   const phone = normalizePhone(chatId);
   if (!phone) return null;
 
-  const byPhone = chats.find((c) => c.externalChatId === phone);
+  const byPhone = chats.find(
+    (c) => c.externalChatId === phone || c.stableChatKey === phone
+  );
   if (byPhone) return byPhone;
 
   return null;
 }
-
 function getJidsToQueryFromChat(chat) {
   if (!chat) return [];
   const set = new Set(

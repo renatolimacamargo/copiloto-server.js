@@ -332,6 +332,9 @@ function extractMessagePayloadParts(message) {
     durationSeconds: null,
     ptt: false,
     reactionText: null,
+    reactionTargetMessageId: null,
+    reactionTargetRemoteJid: null,
+    reactionTargetFromMe: null,
     deleted: false
   };
 
@@ -362,8 +365,16 @@ function extractMessagePayloadParts(message) {
     return {
       ...base,
       messageType: 'reactionMessage',
-      messageText: null,
-      reactionText: message.reactionMessage?.text || null
+      messageText: message.reactionMessage?.text
+        ? `[reactionMessage:${message.reactionMessage.text}]`
+        : '[reactionMessage]',
+      reactionText: message.reactionMessage?.text || null,
+      reactionTargetMessageId: message.reactionMessage?.key?.id || null,
+      reactionTargetRemoteJid: message.reactionMessage?.key?.remoteJid || null,
+      reactionTargetFromMe:
+        typeof message.reactionMessage?.key?.fromMe === 'boolean'
+          ? message.reactionMessage.key.fromMe
+          : null
     };
   }
 
@@ -765,6 +776,9 @@ function normalizeMessageRecord(record, fallback = {}) {
     durationSeconds: parts.durationSeconds,
     ptt: parts.ptt,
     reactionText: parts.reactionText,
+    reactionTargetMessageId: parts.reactionTargetMessageId,
+    reactionTargetRemoteJid: parts.reactionTargetRemoteJid,
+    reactionTargetFromMe: parts.reactionTargetFromMe,
     deleted
   };
 }

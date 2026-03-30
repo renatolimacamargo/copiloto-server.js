@@ -519,6 +519,52 @@ function getPreferredExternalChatId({ primaryJid, altJid, isGroup }) {
   return getExternalChatIdFromJid(primaryJid || altJid || null);
 }
 
+const lidToPnMap = new Map();
+const pnToLidMap = new Map();
+
+function rememberJidAlias(primaryJid, altJid) {
+  const a = primaryJid || null;
+  const b = altJid || null;
+
+  if (!a || !b) return;
+
+  const aIsLid = isLidJid(a);
+  const bIsLid = isLidJid(b);
+  const aIsPn = isPnJid(a);
+  const bIsPn = isPnJid(b);
+
+  if (aIsLid && bIsPn) {
+    lidToPnMap.set(a, b);
+    pnToLidMap.set(b, a);
+    return;
+  }
+
+  if (bIsLid && aIsPn) {
+    lidToPnMap.set(b, a);
+    pnToLidMap.set(a, b);
+  }
+}
+
+function resolvePreferredDirectJid(rawRemoteJid, altRemoteJid) {
+  rememberJidAlias(rawRemoteJid, altRemoteJid);
+
+  const direct = pickBestDirectJid(rawRemoteJid, altRemoteJid);
+
+  if (isLidJid(direct) && lidToPnMap.has(direct)) {
+    return lidToPnMap.get(direct);
+  }
+
+  if (isLidJid(rawRemoteJid) && lidToPnMap.has(rawRemoteJid)) {
+    return lidToPnMap.get(rawRemoteJid);
+  }
+
+  if (isLidJid(altRemoteJid) && lidToPnMap.has(altRemoteJid)) {
+    return lidToPnMap.get(altRemoteJid);
+  }
+
+  return direct;
+}
+
 function getChatRawRemoteJid(chat) {
   return (
     chat?.remoteJid ||
@@ -572,6 +618,13 @@ function getChatTimestamp(chat) {
   );
 }
 
+
+function isValidPhoneStrict(phone) {
+  if (!phone) return false;
+  const str = String(phone);
+  return /^\d{10,15}$/.test(str);
+}
+
 function normalizeChatRecord(chat) {
   const rawRemoteJid = getChatRawRemoteJid(chat);
   const altRemoteJid = getChatAltRemoteJid(chat);
@@ -580,7 +633,7 @@ function normalizeChatRecord(chat) {
 
   const preferredJid = isGroup
     ? (isGroupJid(rawRemoteJid) ? rawRemoteJid : altRemoteJid || rawRemoteJid)
-    : pickBestDirectJid(rawRemoteJid, altRemoteJid);
+    : resolvePreferredDirectJid(rawRemoteJid, altRemoteJid);
 
   let externalChatId = getPreferredExternalChatId({
     primaryJid: rawRemoteJid,
@@ -589,17 +642,30 @@ function normalizeChatRecord(chat) {
   });
 
   if (!isGroup) {
-    externalChatId =
-      normalizePhone(externalChatId) ||
-      normalizePhone(preferredJid) ||
-      normalizePhone(rawRemoteJid) ||
-      normalizePhone(altRemoteJid) ||
+    const pn =
+      (isPnJid(preferredJid) && normalizePhone(preferredJid)) ||
+      (isPnJid(rawRemoteJid) && normalizePhone(rawRemoteJid)) ||
+      (isPnJid(altRemoteJid) && normalizePhone(altRemoteJid)) ||
       null;
+
+    if (!pn || !isValidPhoneStrict(pn)) {
+      return null;
+    }
+
+    externalChatId = pn;
   }
 
   const stableChatKey = isGroup
     ? (preferredJid || rawRemoteJid || altRemoteJid || null)
     : externalChatId;
+
+  if (!stableChatKey) {
+    return null;
+  }
+
+  if (!isGroup && !isValidPhoneStrict(stableChatKey)) {
+    return null;
+  }
 
   return {
     raw: chat,
@@ -643,9 +709,11 @@ function normalizeMessageRecord(record, fallback = {}) {
 
   const isGroup = isGroupJid(rawRemoteJid) || isGroupJid(altRemoteJid);
 
+  rememberJidAlias(rawRemoteJid, altRemoteJid);
+
   const preferredJid = isGroup
     ? (isGroupJid(rawRemoteJid) ? rawRemoteJid : altRemoteJid || rawRemoteJid)
-    : pickBestDirectJid(rawRemoteJid, altRemoteJid, fallback.remoteJid);
+    : resolvePreferredDirectJid(rawRemoteJid, altRemoteJid || fallback.remoteJid);
 
   const externalChatId = getPreferredExternalChatId({
     primaryJid: rawRemoteJid,
@@ -790,6 +858,58 @@ async function tryEvolutionCandidates(candidates) {
   };
 }
 
+
+function scoreChatCandidate(chat) {
+  if (!chat) return -1;
+
+  let score = 0;
+
+  if (chat.externalChatId && /^\d{10,15}$/.test(String(chat.externalChatId))) score += 100;
+  if (chat.stableChatKey && /^\d{10,15}$/.test(String(chat.stableChatKey))) score += 80;
+  if (chat.queryRemoteJid && isPnJid(chat.queryRemoteJid)) score += 60;
+  if (chat.remoteJid && isPnJid(chat.remoteJid)) score += 40;
+  if (chat.altRemoteJid && isPnJid(chat.altRemoteJid)) score += 30;
+  if (chat.displayName) score += 10;
+  if (chat.profilePicUrl) score += 5;
+  if (chat.unreadCount != null) score += 3;
+  if (chat.lastMessagePreview) score += 2;
+
+  return score;
+}
+
+function dedupeChatsByStableKey(chats) {
+  const byKey = new Map();
+
+  for (const chat of chats) {
+    if (!chat?.stableChatKey) continue;
+
+    const existing = byKey.get(chat.stableChatKey);
+    if (!existing) {
+      byKey.set(chat.stableChatKey, chat);
+      continue;
+    }
+
+    const existingScore = scoreChatCandidate(existing);
+    const currentScore = scoreChatCandidate(chat);
+
+    if (currentScore > existingScore) {
+      byKey.set(chat.stableChatKey, chat);
+      continue;
+    }
+
+    if (currentScore == existingScore) {
+      const existingTs = unixSecondsFromAny(existing.lastMessageAt);
+      const currentTs = unixSecondsFromAny(chat.lastMessageAt);
+
+      if (currentTs > existingTs) {
+        byKey.set(chat.stableChatKey, chat);
+      }
+    }
+  }
+
+  return Array.from(byKey.values());
+}
+
 async function fetchAllNormalizedChats() {
   const { response, data } = await evolutionRequest(`/chat/findChats/${EVOLUTION_INSTANCE}`);
 
@@ -797,10 +917,14 @@ async function fetchAllNormalizedChats() {
     throw new Error(`evolution_find_chats_failed: ${JSON.stringify(data)}`);
   }
 
-  const chats = extractArrayFromEvolutionResponse(data).map(normalizeChatRecord);
+  const chats = extractArrayFromEvolutionResponse(data)
+    .map(normalizeChatRecord)
+    .filter(Boolean)
+    .filter((chat) => chat.queryRemoteJid && chat.externalChatId);
 
-  return chats
-    .filter((chat) => chat.queryRemoteJid && chat.externalChatId)
+  const dedupedChats = dedupeChatsByStableKey(chats);
+
+  return dedupedChats
     .sort((a, b) => unixSecondsFromAny(b.lastMessageAt) - unixSecondsFromAny(a.lastMessageAt))
     .slice(0, CHAT_LIST_LIMIT);
 }

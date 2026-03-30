@@ -1204,8 +1204,43 @@ const evolutionInstanceState = {
   connected: false,
   status: 'unknown',
   lastEventAt: null,
+  lastReconnectAt: null,
+  resyncInProgress: false,
+  lastResyncAt: null,
+  lastResyncCount: null,
+  lastResyncError: null,
   source: 'startup'
 };
+
+async function triggerEvolutionResync(reason = 'manual') {
+  if (evolutionInstanceState.resyncInProgress) {
+    return;
+  }
+
+  evolutionInstanceState.resyncInProgress = true;
+  evolutionInstanceState.lastResyncError = null;
+
+  try {
+    const chats = await fetchAllNormalizedChats();
+    evolutionInstanceState.lastResyncAt = new Date().toISOString();
+    evolutionInstanceState.lastResyncCount = Array.isArray(chats) ? chats.length : null;
+    console.log('🔄 Evolution resync concluído:', {
+      reason,
+      count: evolutionInstanceState.lastResyncCount,
+      instanceName: evolutionInstanceState.instanceName
+    });
+  } catch (err) {
+    evolutionInstanceState.lastResyncAt = new Date().toISOString();
+    evolutionInstanceState.lastResyncError = err?.message || String(err);
+    console.error('❌ Evolution resync falhou:', {
+      reason,
+      error: evolutionInstanceState.lastResyncError,
+      instanceName: evolutionInstanceState.instanceName
+    });
+  } finally {
+    evolutionInstanceState.resyncInProgress = false;
+  }
+}
 
 app.get('/health', (req, res) => {
   res.json({ ok: true });
@@ -1220,6 +1255,11 @@ app.get('/api/sync/status', async (req, res) => {
     statusSource: evolutionInstanceState.source,
     instanceName: evolutionInstanceState.instanceName,
     lastEventAt: evolutionInstanceState.lastEventAt,
+    lastReconnectAt: evolutionInstanceState.lastReconnectAt,
+    resyncInProgress: evolutionInstanceState.resyncInProgress,
+    lastResyncAt: evolutionInstanceState.lastResyncAt,
+    lastResyncCount: evolutionInstanceState.lastResyncCount,
+    lastResyncError: evolutionInstanceState.lastResyncError,
     supabase: {
       enabled: true,
       usage: 'contacts_only'
@@ -1750,6 +1790,7 @@ app.post('/evolution', async (req, res) => {
 
     if (eventType === 'connection.update') {
       const normalized = String(rawConnectionState || '').toLowerCase();
+      const wasConnected = evolutionInstanceState.connected;
 
       const isConnected =
         normalized === 'open' ||
@@ -1761,6 +1802,11 @@ app.post('/evolution', async (req, res) => {
       evolutionInstanceState.status = rawConnectionState || (isConnected ? 'connected' : 'disconnected');
       evolutionInstanceState.lastEventAt = new Date().toISOString();
       evolutionInstanceState.source = 'webhook';
+
+      if (!wasConnected && isConnected) {
+        evolutionInstanceState.lastReconnectAt = new Date().toISOString();
+        void triggerEvolutionResync('reconnect');
+      }
     }
 
     console.log('📩 Webhook recebido:', {

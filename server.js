@@ -185,7 +185,7 @@ function decryptWhatsAppMedia(buffer, mediaKey, messageType, mimetype) {
   const mediaKeyBuffer = Buffer.from(mediaKey, 'base64');
   const info = mediaTypeToKeyInfo(messageType, mimetype);
 
-  const expanded = crypto.hkdfSync(
+  const expandedRaw = crypto.hkdfSync(
     'sha256',
     mediaKeyBuffer,
     Buffer.alloc(32, 0),
@@ -193,11 +193,15 @@ function decryptWhatsAppMedia(buffer, mediaKey, messageType, mimetype) {
     112
   );
 
-  const iv = expanded.subarray(0, 16);
-  const cipherKey = expanded.subarray(16, 48);
+  const expanded = Buffer.isBuffer(expandedRaw)
+    ? expandedRaw
+    : Buffer.from(expandedRaw);
+
+  const iv = expanded.slice(0, 16);
+  const cipherKey = expanded.slice(16, 48);
 
   // WhatsApp anexa MAC de 10 bytes no final
-  const encrypted = buffer.length > 10 ? buffer.subarray(0, buffer.length - 10) : buffer;
+  const encrypted = buffer.length > 10 ? buffer.slice(0, buffer.length - 10) : buffer;
 
   const decipher = crypto.createDecipheriv('aes-256-cbc', cipherKey, iv);
 

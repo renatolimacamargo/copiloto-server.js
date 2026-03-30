@@ -588,12 +588,17 @@ function normalizeChatRecord(chat) {
     isGroup
   });
 
+  const stableChatKey = isGroup
+    ? (preferredJid || rawRemoteJid || altRemoteJid || null)
+    : (externalChatId || normalizePhone(preferredJid) || normalizePhone(rawRemoteJid) || normalizePhone(altRemoteJid) || null);
+
   return {
     raw: chat,
     rawRemoteJid,
     altRemoteJid,
     remoteJid: preferredJid,
-    queryRemoteJid: rawRemoteJid || altRemoteJid || preferredJid,
+    queryRemoteJid: preferredJid || rawRemoteJid || altRemoteJid,
+    stableChatKey,
     isGroup,
     externalChatId,
     displayName: getChatDisplayName(chat),
@@ -920,6 +925,7 @@ async function resolveChatForMessages(chatId) {
       rawRemoteJid: chatId,
       remoteJid: chatId,
       altRemoteJid: null,
+      stableChatKey: isGroup ? chatId : normalizePhone(chatId),
       externalChatId: isGroup ? chatId : normalizePhone(chatId),
       isGroup,
       displayName: null,
@@ -935,6 +941,7 @@ async function resolveChatForMessages(chatId) {
     rawRemoteJid: `${normalizedPhone}@s.whatsapp.net`,
     remoteJid: `${normalizedPhone}@s.whatsapp.net`,
     altRemoteJid: null,
+    stableChatKey: normalizedPhone,
     externalChatId: normalizedPhone,
     isGroup: false,
     displayName: null,

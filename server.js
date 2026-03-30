@@ -1387,7 +1387,56 @@ app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
+
+
+// ===============================
+// EVOLUTION STATUS REFRESH (AUTO)
+// ===============================
+async function refreshEvolutionInstanceState() {
+  try {
+    const { response, data } = await evolutionGet(`/instance/connectionState/${EVOLUTION_INSTANCE}`);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const raw =
+      data?.instance?.state ||
+      data?.state ||
+      data?.status ||
+      'unknown';
+
+    const normalized = String(raw).toLowerCase();
+
+    const connected =
+      normalized === 'open' ||
+      normalized === 'connected' ||
+      normalized === 'online';
+
+    evolutionInstanceState.connected = connected;
+    evolutionInstanceState.status = raw;
+    evolutionInstanceState.instanceName = EVOLUTION_INSTANCE;
+    evolutionInstanceState.lastEventAt = new Date().toISOString();
+    evolutionInstanceState.source = 'poll';
+
+  } catch (err) {
+    evolutionInstanceState.connected = false;
+    evolutionInstanceState.status = 'unknown';
+    evolutionInstanceState.source = 'poll_error';
+  }
+}
+
+
 app.get('/api/sync/status', async (req, res) => {
+  const shouldRefresh =
+    !evolutionInstanceState.lastEventAt ||
+    evolutionInstanceState.source === 'startup' ||
+    evolutionInstanceState.status === 'unknown';
+
+  if (shouldRefresh) {
+    await refreshEvolutionInstanceState();
+  }
+
   return res.status(200).json({
     ok: true,
     connected: evolutionInstanceState.connected,

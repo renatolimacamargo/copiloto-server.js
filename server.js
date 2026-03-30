@@ -1199,6 +1199,14 @@ function parseRangeHeader(rangeHeader, totalLength) {
   return { start, end };
 }
 
+const evolutionInstanceState = {
+  instanceName: EVOLUTION_INSTANCE,
+  connected: false,
+  status: 'unknown',
+  lastEventAt: null,
+  source: 'startup'
+};
+
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
@@ -1206,10 +1214,12 @@ app.get('/health', (req, res) => {
 app.get('/api/sync/status', async (req, res) => {
   return res.status(200).json({
     ok: true,
-    connected: true,
-    status: 'live',
+    connected: evolutionInstanceState.connected,
+    status: evolutionInstanceState.status,
     mode: 'evolution-live-only',
-    statusSource: 'live',
+    statusSource: evolutionInstanceState.source,
+    instanceName: evolutionInstanceState.instanceName,
+    lastEventAt: evolutionInstanceState.lastEventAt,
     supabase: {
       enabled: true,
       usage: 'contacts_only'
@@ -1724,6 +1734,34 @@ app.post('/evolution', async (req, res) => {
       : pickBestDirectJid(rawRemoteJid, altRemoteJid);
 
     const parts = extractMessagePayloadParts(message);
+
+    const connectionCandidates = [
+      data?.state,
+      data?.status,
+      data?.connection,
+      payload?.state,
+      payload?.status,
+      data?.instance?.state,
+      data?.instance?.status
+    ].filter(Boolean);
+
+    const rawConnectionState =
+      connectionCandidates.find((v) => typeof v === 'string') || null;
+
+    if (eventType === 'connection.update') {
+      const normalized = String(rawConnectionState || '').toLowerCase();
+
+      const isConnected =
+        normalized === 'open' ||
+        normalized === 'connected' ||
+        normalized === 'online';
+
+      evolutionInstanceState.instanceName = payload?.instance || EVOLUTION_INSTANCE;
+      evolutionInstanceState.connected = isConnected;
+      evolutionInstanceState.status = rawConnectionState || (isConnected ? 'connected' : 'disconnected');
+      evolutionInstanceState.lastEventAt = new Date().toISOString();
+      evolutionInstanceState.source = 'webhook';
+    }
 
     console.log('📩 Webhook recebido:', {
       eventType,

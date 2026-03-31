@@ -1788,6 +1788,98 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
+
+app.post('/api/send-reaction', async (req, res) => {
+  try {
+    const {
+      chatId,
+      messageId,
+      reaction,
+      remoteJid,
+      fromMe
+    } = req.body || {};
+
+    const targetMessageId = String(messageId || '').trim();
+    const reactionText = reaction == null ? '' : String(reaction);
+    const explicitRemoteJid = String(remoteJid || '').trim() || null;
+
+    if (!targetMessageId) {
+      return res.status(400).json({ error: 'messageId_required' });
+    }
+
+    if (reaction !== '' && !reactionText.trim()) {
+      return res.status(400).json({ error: 'reaction_required' });
+    }
+
+    let resolvedRemoteJid = explicitRemoteJid;
+    let resolvedFromMe =
+      typeof fromMe === 'boolean'
+        ? fromMe
+        : null;
+
+    if (!resolvedRemoteJid) {
+      const target = await resolveChatActionTarget(String(chatId || '').trim());
+      if (!target?.bestJid) {
+        return res.status(400).json({ error: 'invalid_chatId' });
+      }
+      resolvedRemoteJid = target.bestJid;
+    }
+
+    if (resolvedFromMe === null) {
+      resolvedFromMe = true;
+    }
+
+    const response = await fetchWithTimeout(
+      `${EVOLUTION_BASE_URL}/message/sendReaction/${EVOLUTION_INSTANCE}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: EVOLUTION_API_KEY
+        },
+        body: JSON.stringify({
+          key: {
+            remoteJid: resolvedRemoteJid,
+            fromMe: resolvedFromMe,
+            id: targetMessageId
+          },
+          reaction: reactionText
+        })
+      }
+    );
+
+    const raw = await response.text();
+    let data = null;
+
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = { raw };
+    }
+
+    if (!response.ok) {
+      console.error('Erro Evolution sendReaction:', data);
+      return res.status(response.status).json({
+        error: 'evolution_send_reaction_failed',
+        details: data
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      reaction: reactionText,
+      targetMessageId,
+      remoteJid: resolvedRemoteJid,
+      fromMe: resolvedFromMe,
+      evolution: data
+    });
+  } catch (err) {
+    console.error('Erro geral /api/send-reaction:', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
 app.get('/api/chat/profile-picture', async (req, res) => {
   try {
     const chatId = String(req.query.chatId || '').trim();

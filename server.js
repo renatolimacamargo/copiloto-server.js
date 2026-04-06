@@ -20,20 +20,9 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '25mb' }));
 
-app.use((req, res, next) => {
-  try {
-    if (req.method === 'POST' && req.body) {
-      setImmediate(() => {
-        maybeHandleAutoReplyFromWebhookBody(req.body).catch((err) => {
-          console.error('[auto-reply] middleware async error:', err);
-        });
-      });
-    }
-  } catch (err) {
-    console.error('[auto-reply] middleware error:', err);
-  }
-  next();
-});
+app.use(express.json({ limit: '25mb' }));
+
+
 
 
 // SUPABASE: nesta fase usar SOMENTE contatos
@@ -2320,7 +2309,6 @@ app.post('/api/send-media', async (req, res) => {
 const fs = require('fs');
 const path = require('path');
 
-const AUTO_REPLY_CONFIG_PATH = path.join(__dirname, 'auto-reply-settings.json');
 
 const DEFAULT_AUTO_REPLY_SETTINGS = {
   autoReplyEnabled: true,
@@ -2342,54 +2330,150 @@ const DEFAULT_AUTO_REPLY_SETTINGS = {
   closedDays: []
 };
 
-function ensureAutoReplySettingsFile() {
-  if (!fs.existsSync(AUTO_REPLY_CONFIG_PATH)) {
-    fs.writeFileSync(
-      AUTO_REPLY_CONFIG_PATH,
-      JSON.stringify(DEFAULT_AUTO_REPLY_SETTINGS, null, 2),
-      'utf8'
-    );
-  }
-}
 
-function loadAutoReplySettings() {
-  try {
-    ensureAutoReplySettingsFile();
-    const raw = fs.readFileSync(AUTO_REPLY_CONFIG_PATH, 'utf8');
-    const parsed = JSON.parse(raw || '{}');
-    return {
-      ...DEFAULT_AUTO_REPLY_SETTINGS,
-      ...parsed,
-      businessHours: {
-        ...DEFAULT_AUTO_REPLY_SETTINGS.businessHours,
-        ...(parsed.businessHours || {})
-      },
-      closedDays: Array.isArray(parsed.closedDays) ? parsed.closedDays : []
-    };
-  } catch (err) {
-    console.error('Erro ao carregar auto-reply settings:', err);
-    return JSON.parse(JSON.stringify(DEFAULT_AUTO_REPLY_SETTINGS));
-  }
-}
+function mapAppSettingsRowToAutoReplySettings(row = {}) {
+  const closedDays = Array.isArray(row.closed_days) ? row.closed_days : [];
 
-function saveAutoReplySettings(settings) {
-  const merged = {
-    ...DEFAULT_AUTO_REPLY_SETTINGS,
-    ...(settings || {}),
+  return {
+    autoReplyEnabled: row.auto_reply_enabled !== false,
+    autoReplyReactivationMode: String(row.auto_reply_reactivation_minutes || 120),
+    autoReplyReactivationMinutes: Number(row.auto_reply_reactivation_minutes || 120),
+    greetingMessage:
+      row.default_greeting_message ||
+      DEFAULT_AUTO_REPLY_SETTINGS.greetingMessage,
+    offHoursMessage:
+      row.after_hours_message ||
+      DEFAULT_AUTO_REPLY_SETTINGS.offHoursMessage,
     businessHours: {
-      ...DEFAULT_AUTO_REPLY_SETTINGS.businessHours,
-      ...((settings && settings.businessHours) || {})
+      monday: {
+        enabled: true,
+        start: row.business_hours_week_start || '08:00',
+        end: row.business_hours_week_end || '18:00'
+      },
+      tuesday: {
+        enabled: true,
+        start: row.business_hours_week_start || '08:00',
+        end: row.business_hours_week_end || '18:00'
+      },
+      wednesday: {
+        enabled: true,
+        start: row.business_hours_week_start || '08:00',
+        end: row.business_hours_week_end || '18:00'
+      },
+      thursday: {
+        enabled: true,
+        start: row.business_hours_week_start || '08:00',
+        end: row.business_hours_week_end || '18:00'
+      },
+      friday: {
+        enabled: true,
+        start: row.business_hours_week_start || '08:00',
+        end: row.business_hours_week_end || '18:00'
+      },
+      saturday: {
+        enabled: !!row.saturday_start && !!row.saturday_end,
+        start: row.saturday_start || '08:00',
+        end: row.saturday_end || '12:00'
+      },
+      sunday: {
+        enabled: row.sunday_enabled === true,
+        start: row.sunday_start || '08:00',
+        end: row.sunday_end || '12:00'
+      }
     },
-    closedDays: Array.isArray(settings?.closedDays) ? settings.closedDays : []
+    closedDays
+  };
+}
+
+function mapAutoReplySettingsToAppSettingsPayload(settings = {}) {
+  const businessHours = settings.businessHours || {};
+  const monday = businessHours.monday || {};
+  const saturday = businessHours.saturday || {};
+  const sunday = businessHours.sunday || {};
+
+  return {
+    auto_reply_enabled: settings.autoReplyEnabled !== false,
+    auto_reply_reactivation_minutes: Number(settings.autoReplyReactivationMinutes || 120),
+    default_greeting_message:
+      settings.greetingMessage || DEFAULT_AUTO_REPLY_SETTINGS.greetingMessage,
+    after_hours_message:
+      settings.offHoursMessage || DEFAULT_AUTO_REPLY_SETTINGS.offHoursMessage,
+    business_hours_week_start: monday.start || '08:00',
+    business_hours_week_end: monday.end || '18:00',
+    saturday_start: saturday.enabled === false ? null : (saturday.start || '08:00'),
+    saturday_end: saturday.enabled === false ? null : (saturday.end || '12:00'),
+    sunday_enabled: sunday.enabled === true,
+    sunday_start: sunday.enabled === true ? (sunday.start || '08:00') : null,
+    sunday_end: sunday.enabled === true ? (sunday.end || '12:00') : null,
+    closed_days: Array.isArray(settings.closedDays) ? settings.closedDays : [],
+    updated_at: new Date().toISOString()
+  };
+}
+
+async function getOrCreateAppSettingsRow() {
+  let { data, error } = await supabase
+    .from('app_settings')
+    .select('*')
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (!error && data) {
+    return data;
+  }
+
+  const insertPayload = {
+    clinic_name: 'Paula Talarico Estética Personalizada',
+    communication_tone: 'premium',
+    max_auto_replies_per_contact: 1,
+    auto_reply_enabled: true,
+    auto_reply_reactivation_minutes: 120,
+    business_hours_week_start: '08:00',
+    business_hours_week_end: '18:00',
+    saturday_start: '08:00',
+    saturday_end: '12:00',
+    sunday_enabled: false,
+    default_greeting_message: DEFAULT_AUTO_REPLY_SETTINGS.greetingMessage,
+    after_hours_message: DEFAULT_AUTO_REPLY_SETTINGS.offHoursMessage,
+    closed_days: [],
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
   };
 
-  fs.writeFileSync(
-    AUTO_REPLY_CONFIG_PATH,
-    JSON.stringify(merged, null, 2),
-    'utf8'
-  );
+  const inserted = await supabase
+    .from('app_settings')
+    .insert(insertPayload)
+    .select('*')
+    .single();
 
-  return merged;
+  if (inserted.error) {
+    throw inserted.error;
+  }
+
+  return inserted.data;
+}
+
+async function loadAutoReplySettings() {
+  const row = await getOrCreateAppSettingsRow();
+  return mapAppSettingsRowToAutoReplySettings(row);
+}
+
+async function saveAutoReplySettings(settings) {
+  const row = await getOrCreateAppSettingsRow();
+  const payload = mapAutoReplySettingsToAppSettingsPayload(settings);
+
+  const updated = await supabase
+    .from('app_settings')
+    .update(payload)
+    .eq('id', row.id)
+    .select('*')
+    .single();
+
+  if (updated.error) {
+    throw updated.error;
+  }
+
+  return mapAppSettingsRowToAutoReplySettings(updated.data);
 }
 
 function getGreetingByHour(date = new Date()) {
@@ -2454,17 +2538,8 @@ function isNowWithinBusinessHours(settings, date = new Date()) {
 }
 
 function resolveAutoReplyReactivationMinutes(settings) {
-  const mode = String(settings?.autoReplyReactivationMode || '120').trim();
-  if (mode === '60') return 60;
-  if (mode === '120') return 120;
-  if (mode === 'custom') {
-    const custom = Number(settings?.autoReplyReactivationMinutes || 0);
-    return Number.isFinite(custom) && custom > 0 ? custom : 120;
-  }
-  if (mode === 'always') return 0;
-  if (mode === 'off') return null;
-  const numeric = Number(mode);
-  return Number.isFinite(numeric) && numeric >= 0 ? numeric : 120;
+  const minutes = Number(settings?.autoReplyReactivationMinutes || 120);
+  return Number.isFinite(minutes) && minutes >= 0 ? minutes : 120;
 }
 
 function renderAutoReplyTemplate(template, date = new Date()) {
@@ -2485,227 +2560,25 @@ function buildAutoReplyMessage(settings, date = new Date()) {
 }
 
 
-const AUTO_REPLY_RECENT_INBOUND_IDS = new Map();
-
-function cleanupRecentInboundIds(nowMs = Date.now()) {
-  for (const [key, ts] of AUTO_REPLY_RECENT_INBOUND_IDS.entries()) {
-    if ((nowMs - ts) > (5 * 60 * 1000)) {
-      AUTO_REPLY_RECENT_INBOUND_IDS.delete(key);
-    }
-  }
-}
-
-function rememberRecentInboundId(messageId) {
-  if (!messageId) return;
-  cleanupRecentInboundIds();
-  AUTO_REPLY_RECENT_INBOUND_IDS.set(String(messageId), Date.now());
-}
-
-function hasRecentInboundId(messageId) {
-  if (!messageId) return false;
-  cleanupRecentInboundIds();
-  return AUTO_REPLY_RECENT_INBOUND_IDS.has(String(messageId));
-}
-
-function looksLikeEvolutionWebhookBody(body) {
-  if (!body || typeof body !== 'object') return false;
-
-  if (body.event || body.eventType || body.instance || body.instanceName) {
-    return true;
-  }
-
-  if (body.data && typeof body.data === 'object') {
-    if (body.data.key || body.data.message || body.data.messages) {
-      return true;
-    }
-  }
-
-  if (Array.isArray(body.messages) && body.messages.length > 0) {
-    return true;
-  }
-
-  return false;
-}
-
-function extractFirstWebhookRecord(body) {
-  const candidates = [
-    body?.data?.message,
-    body?.data,
-    Array.isArray(body?.data?.messages) ? body.data.messages[0] : null,
-    Array.isArray(body?.messages) ? body.messages[0] : null,
-    body?.message,
-    body
-  ].filter(Boolean);
-
-  for (const item of candidates) {
-    if (!item || typeof item !== 'object') continue;
-    if (item.key || item.message || item.messageType || item.remoteJid || item.id) {
-      return item;
-    }
-  }
-
-  return null;
-}
-
-async function sendAutoReplyText(externalChatId, text) {
-  const phone = normalizePhone(externalChatId);
-  if (!phone || !text) {
-    return { ok: false, reason: 'invalid_phone_or_text' };
-  }
-
-  const result = await tryEvolutionCandidates([
-    {
-      method: 'POST',
-      path: `/message/sendText/${EVOLUTION_INSTANCE}`,
-      body: { number: phone, text }
-    },
-    {
-      method: 'POST',
-      path: `/message/sendText/${EVOLUTION_INSTANCE}`,
-      body: { number: phone, message: text }
-    }
-  ]);
-
-  if (!result.ok) {
-    return {
-      ok: false,
-      reason: 'evolution_send_text_failed',
-      attempts: result.attempts
-    };
-  }
-
-  return {
-    ok: true,
-    data: result.data
-  };
-}
-
-async function maybeHandleAutoReplyFromWebhookBody(body) {
+app.get('/api/settings/auto-reply', async (req, res) => {
   try {
-    if (!looksLikeEvolutionWebhookBody(body)) {
-      return;
-    }
-
-    const eventType = String(body?.event || body?.eventType || '').trim().toLowerCase();
-
-    if (
-      eventType &&
-      !eventType.includes('message')
-    ) {
-      return;
-    }
-
-    const record = extractFirstWebhookRecord(body);
-    if (!record) {
-      return;
-    }
-
-    const normalized = normalizeMessageRecord(record, {});
-
-    if (!normalized) return;
-    if (!normalized.externalChatId) return;
-    if (normalized.isGroup) return;
-    if (normalized.fromMe) return;
-    if (normalized.deleted) return;
-    if (normalized.messageType === 'reactionMessage') return;
-
-    const inboundMessageId = normalized.externalMessageId || null;
-    if (hasRecentInboundId(inboundMessageId)) {
-      console.log('[auto-reply] skip: inbound duplicado recente', inboundMessageId);
-      return;
-    }
-    rememberRecentInboundId(inboundMessageId);
-
-    const settings = loadAutoReplySettings();
-    if (!settings.autoReplyEnabled) {
-      console.log('[auto-reply] skip: desabilitado');
-      return;
-    }
-
-    const reactivationMinutes = resolveAutoReplyReactivationMinutes(settings);
-    if (reactivationMinutes === null) {
-      console.log('[auto-reply] skip: modo desligado');
-      return;
-    }
-
-    const chat = await resolveChatForMessages(
-      normalized.externalChatId || normalized.remoteJid || normalized.rawRemoteJid
-    );
-
-    if (!chat) {
-      console.log('[auto-reply] skip: chat não resolvido');
-      return;
-    }
-
-    const merged = await fetchMergedMessagesForChat(chat, 200);
-
-    let latestOutgoingTs = 0;
-    for (const msg of merged.messages || []) {
-      if (!msg || !msg.fromMe) continue;
-      const ts = Number(msg.timestampUnix || 0);
-      if (ts > latestOutgoingTs) {
-        latestOutgoingTs = ts;
-      }
-    }
-
-    const nowTs = Number(normalized.timestampUnix || Math.floor(Date.now() / 1000));
-    const windowSeconds = Math.max(0, Number(reactivationMinutes || 0)) * 60;
-
-    if (windowSeconds > 0 && latestOutgoingTs > 0) {
-      const diff = nowTs - latestOutgoingTs;
-      if (diff >= 0 && diff < windowSeconds) {
-        console.log('[auto-reply] skip: mensagem minha recente', {
-          externalChatId: normalized.externalChatId,
-          diffSeconds: diff,
-          reactivationMinutes
-        });
-        return;
-      }
-    }
-
-    const autoReply = buildAutoReplyMessage(settings, new Date());
-
-    if (!autoReply?.text || !String(autoReply.text).trim()) {
-      console.log('[auto-reply] skip: texto vazio');
-      return;
-    }
-
-    const sendResult = await sendAutoReplyText(
-      normalized.externalChatId,
-      autoReply.text
-    );
-
-    if (!sendResult.ok) {
-      console.error('[auto-reply] erro ao enviar', {
-        externalChatId: normalized.externalChatId,
-        reason: sendResult.reason,
-        attempts: sendResult.attempts || null
-      });
-      return;
-    }
-
-    console.log('[auto-reply] enviado com sucesso', {
-      externalChatId: normalized.externalChatId,
-      inBusinessHours: autoReply.inBusinessHours,
-      reactivationMinutes
+    const settings = await loadAutoReplySettings();
+    return res.status(200).json({
+      ok: true,
+      settings
     });
   } catch (err) {
-    console.error('[auto-reply] erro geral:', err);
+    console.error('Erro ao carregar /api/settings/auto-reply:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'failed_to_load_auto_reply_settings'
+    });
   }
-}
-
-
-app.get('/api/settings/auto-reply', async (req, res) => {
-  const settings = loadAutoReplySettings();
-  return res.status(200).json({
-    ok: true,
-    settings
-  });
 });
 
 app.post('/api/settings/auto-reply', async (req, res) => {
   try {
-    const saved = saveAutoReplySettings(req.body || {});
+    const saved = await saveAutoReplySettings(req.body || {});
     return res.status(200).json({
       ok: true,
       settings: saved

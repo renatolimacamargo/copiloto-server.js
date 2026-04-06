@@ -20,6 +20,22 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '25mb' }));
 
+app.use((req, res, next) => {
+  try {
+    if (req.method === 'POST' && req.body) {
+      setImmediate(() => {
+        maybeHandleAutoReplyFromWebhookBody(req.body).catch((err) => {
+          console.error('[auto-reply] middleware async error:', err);
+        });
+      });
+    }
+  } catch (err) {
+    console.error('[auto-reply] middleware error:', err);
+  }
+  next();
+});
+
+
 // SUPABASE: nesta fase usar SOMENTE contatos
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -2296,6 +2312,410 @@ app.post('/api/send-media', async (req, res) => {
   } catch (err) {
     console.error('Erro geral /api/send-media:', err);
     return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+
+const fs = require('fs');
+const path = require('path');
+
+const AUTO_REPLY_CONFIG_PATH = path.join(__dirname, 'auto-reply-settings.json');
+
+const DEFAULT_AUTO_REPLY_SETTINGS = {
+  autoReplyEnabled: true,
+  autoReplyReactivationMode: '120',
+  autoReplyReactivationMinutes: 120,
+  greetingMessage:
+    'Olá! {saudacao}\n\nSeja muito bem-vindo(a) à Paula Talarico Estética Personalizada 😊\n\nRecebemos sua mensagem e em breve conduziremos o seu atendimento.',
+  offHoursMessage:
+    'Olá! {saudacao}\n\nAgradecemos o seu contato 😊\n\nNosso horário de atendimento é de segunda a sexta, das 8h às 18h, e aos sábados, das 8h às 12h (exceto feriados).\n\nRetornaremos o mais breve possível, dentro do nosso horário comercial.',
+  businessHours: {
+    monday: { enabled: true, start: '08:00', end: '18:00' },
+    tuesday: { enabled: true, start: '08:00', end: '18:00' },
+    wednesday: { enabled: true, start: '08:00', end: '18:00' },
+    thursday: { enabled: true, start: '08:00', end: '18:00' },
+    friday: { enabled: true, start: '08:00', end: '18:00' },
+    saturday: { enabled: true, start: '08:00', end: '12:00' },
+    sunday: { enabled: false, start: '00:00', end: '00:00' }
+  },
+  closedDays: []
+};
+
+function ensureAutoReplySettingsFile() {
+  if (!fs.existsSync(AUTO_REPLY_CONFIG_PATH)) {
+    fs.writeFileSync(
+      AUTO_REPLY_CONFIG_PATH,
+      JSON.stringify(DEFAULT_AUTO_REPLY_SETTINGS, null, 2),
+      'utf8'
+    );
+  }
+}
+
+function loadAutoReplySettings() {
+  try {
+    ensureAutoReplySettingsFile();
+    const raw = fs.readFileSync(AUTO_REPLY_CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    return {
+      ...DEFAULT_AUTO_REPLY_SETTINGS,
+      ...parsed,
+      businessHours: {
+        ...DEFAULT_AUTO_REPLY_SETTINGS.businessHours,
+        ...(parsed.businessHours || {})
+      },
+      closedDays: Array.isArray(parsed.closedDays) ? parsed.closedDays : []
+    };
+  } catch (err) {
+    console.error('Erro ao carregar auto-reply settings:', err);
+    return JSON.parse(JSON.stringify(DEFAULT_AUTO_REPLY_SETTINGS));
+  }
+}
+
+function saveAutoReplySettings(settings) {
+  const merged = {
+    ...DEFAULT_AUTO_REPLY_SETTINGS,
+    ...(settings || {}),
+    businessHours: {
+      ...DEFAULT_AUTO_REPLY_SETTINGS.businessHours,
+      ...((settings && settings.businessHours) || {})
+    },
+    closedDays: Array.isArray(settings?.closedDays) ? settings.closedDays : []
+  };
+
+  fs.writeFileSync(
+    AUTO_REPLY_CONFIG_PATH,
+    JSON.stringify(merged, null, 2),
+    'utf8'
+  );
+
+  return merged;
+}
+
+function getGreetingByHour(date = new Date()) {
+  const hour = date.getHours();
+  if (hour >= 5 && hour < 12) return 'Bom dia!';
+  if (hour >= 12 && hour < 18) return 'Boa tarde!';
+  return 'Boa noite!';
+}
+
+function formatLocalDateKey(date = new Date()) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function getWeekdayKey(date = new Date()) {
+  const keys = [
+    'sunday',
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday'
+  ];
+  return keys[date.getDay()];
+}
+
+function parseTimeToMinutes(hhmm) {
+  const str = String(hhmm || '').trim();
+  const match = str.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hh = Number(match[1]);
+  const mm = Number(match[2]);
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return (hh * 60) + mm;
+}
+
+function isNowWithinBusinessHours(settings, date = new Date()) {
+  const closedDays = Array.isArray(settings?.closedDays) ? settings.closedDays : [];
+  const todayKey = formatLocalDateKey(date);
+  if (closedDays.includes(todayKey)) {
+    return false;
+  }
+
+  const weekdayKey = getWeekdayKey(date);
+  const dayConfig = settings?.businessHours?.[weekdayKey];
+
+  if (!dayConfig || !dayConfig.enabled) {
+    return false;
+  }
+
+  const startMin = parseTimeToMinutes(dayConfig.start);
+  const endMin = parseTimeToMinutes(dayConfig.end);
+  if (startMin == null || endMin == null) {
+    return false;
+  }
+
+  const nowMin = (date.getHours() * 60) + date.getMinutes();
+  return nowMin >= startMin && nowMin <= endMin;
+}
+
+function resolveAutoReplyReactivationMinutes(settings) {
+  const mode = String(settings?.autoReplyReactivationMode || '120').trim();
+  if (mode === '60') return 60;
+  if (mode === '120') return 120;
+  if (mode === 'custom') {
+    const custom = Number(settings?.autoReplyReactivationMinutes || 0);
+    return Number.isFinite(custom) && custom > 0 ? custom : 120;
+  }
+  if (mode === 'always') return 0;
+  if (mode === 'off') return null;
+  const numeric = Number(mode);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : 120;
+}
+
+function renderAutoReplyTemplate(template, date = new Date()) {
+  const greeting = getGreetingByHour(date);
+  return String(template || '').replace(/\{saudacao\}/g, greeting);
+}
+
+function buildAutoReplyMessage(settings, date = new Date()) {
+  const inHours = isNowWithinBusinessHours(settings, date);
+  const template = inHours
+    ? settings.greetingMessage
+    : settings.offHoursMessage;
+
+  return {
+    inBusinessHours: inHours,
+    text: renderAutoReplyTemplate(template, date)
+  };
+}
+
+
+const AUTO_REPLY_RECENT_INBOUND_IDS = new Map();
+
+function cleanupRecentInboundIds(nowMs = Date.now()) {
+  for (const [key, ts] of AUTO_REPLY_RECENT_INBOUND_IDS.entries()) {
+    if ((nowMs - ts) > (5 * 60 * 1000)) {
+      AUTO_REPLY_RECENT_INBOUND_IDS.delete(key);
+    }
+  }
+}
+
+function rememberRecentInboundId(messageId) {
+  if (!messageId) return;
+  cleanupRecentInboundIds();
+  AUTO_REPLY_RECENT_INBOUND_IDS.set(String(messageId), Date.now());
+}
+
+function hasRecentInboundId(messageId) {
+  if (!messageId) return false;
+  cleanupRecentInboundIds();
+  return AUTO_REPLY_RECENT_INBOUND_IDS.has(String(messageId));
+}
+
+function looksLikeEvolutionWebhookBody(body) {
+  if (!body || typeof body !== 'object') return false;
+
+  if (body.event || body.eventType || body.instance || body.instanceName) {
+    return true;
+  }
+
+  if (body.data && typeof body.data === 'object') {
+    if (body.data.key || body.data.message || body.data.messages) {
+      return true;
+    }
+  }
+
+  if (Array.isArray(body.messages) && body.messages.length > 0) {
+    return true;
+  }
+
+  return false;
+}
+
+function extractFirstWebhookRecord(body) {
+  const candidates = [
+    body?.data?.message,
+    body?.data,
+    Array.isArray(body?.data?.messages) ? body.data.messages[0] : null,
+    Array.isArray(body?.messages) ? body.messages[0] : null,
+    body?.message,
+    body
+  ].filter(Boolean);
+
+  for (const item of candidates) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.key || item.message || item.messageType || item.remoteJid || item.id) {
+      return item;
+    }
+  }
+
+  return null;
+}
+
+async function sendAutoReplyText(externalChatId, text) {
+  const phone = normalizePhone(externalChatId);
+  if (!phone || !text) {
+    return { ok: false, reason: 'invalid_phone_or_text' };
+  }
+
+  const result = await tryEvolutionCandidates([
+    {
+      method: 'POST',
+      path: `/message/sendText/${EVOLUTION_INSTANCE}`,
+      body: { number: phone, text }
+    },
+    {
+      method: 'POST',
+      path: `/message/sendText/${EVOLUTION_INSTANCE}`,
+      body: { number: phone, message: text }
+    }
+  ]);
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      reason: 'evolution_send_text_failed',
+      attempts: result.attempts
+    };
+  }
+
+  return {
+    ok: true,
+    data: result.data
+  };
+}
+
+async function maybeHandleAutoReplyFromWebhookBody(body) {
+  try {
+    if (!looksLikeEvolutionWebhookBody(body)) {
+      return;
+    }
+
+    const eventType = String(body?.event || body?.eventType || '').trim().toLowerCase();
+
+    if (
+      eventType &&
+      !eventType.includes('message')
+    ) {
+      return;
+    }
+
+    const record = extractFirstWebhookRecord(body);
+    if (!record) {
+      return;
+    }
+
+    const normalized = normalizeMessageRecord(record, {});
+
+    if (!normalized) return;
+    if (!normalized.externalChatId) return;
+    if (normalized.isGroup) return;
+    if (normalized.fromMe) return;
+    if (normalized.deleted) return;
+    if (normalized.messageType === 'reactionMessage') return;
+
+    const inboundMessageId = normalized.externalMessageId || null;
+    if (hasRecentInboundId(inboundMessageId)) {
+      console.log('[auto-reply] skip: inbound duplicado recente', inboundMessageId);
+      return;
+    }
+    rememberRecentInboundId(inboundMessageId);
+
+    const settings = loadAutoReplySettings();
+    if (!settings.autoReplyEnabled) {
+      console.log('[auto-reply] skip: desabilitado');
+      return;
+    }
+
+    const reactivationMinutes = resolveAutoReplyReactivationMinutes(settings);
+    if (reactivationMinutes === null) {
+      console.log('[auto-reply] skip: modo desligado');
+      return;
+    }
+
+    const chat = await resolveChatForMessages(
+      normalized.externalChatId || normalized.remoteJid || normalized.rawRemoteJid
+    );
+
+    if (!chat) {
+      console.log('[auto-reply] skip: chat não resolvido');
+      return;
+    }
+
+    const merged = await fetchMergedMessagesForChat(chat, 200);
+
+    let latestOutgoingTs = 0;
+    for (const msg of merged.messages || []) {
+      if (!msg || !msg.fromMe) continue;
+      const ts = Number(msg.timestampUnix || 0);
+      if (ts > latestOutgoingTs) {
+        latestOutgoingTs = ts;
+      }
+    }
+
+    const nowTs = Number(normalized.timestampUnix || Math.floor(Date.now() / 1000));
+    const windowSeconds = Math.max(0, Number(reactivationMinutes || 0)) * 60;
+
+    if (windowSeconds > 0 && latestOutgoingTs > 0) {
+      const diff = nowTs - latestOutgoingTs;
+      if (diff >= 0 && diff < windowSeconds) {
+        console.log('[auto-reply] skip: mensagem minha recente', {
+          externalChatId: normalized.externalChatId,
+          diffSeconds: diff,
+          reactivationMinutes
+        });
+        return;
+      }
+    }
+
+    const autoReply = buildAutoReplyMessage(settings, new Date());
+
+    if (!autoReply?.text || !String(autoReply.text).trim()) {
+      console.log('[auto-reply] skip: texto vazio');
+      return;
+    }
+
+    const sendResult = await sendAutoReplyText(
+      normalized.externalChatId,
+      autoReply.text
+    );
+
+    if (!sendResult.ok) {
+      console.error('[auto-reply] erro ao enviar', {
+        externalChatId: normalized.externalChatId,
+        reason: sendResult.reason,
+        attempts: sendResult.attempts || null
+      });
+      return;
+    }
+
+    console.log('[auto-reply] enviado com sucesso', {
+      externalChatId: normalized.externalChatId,
+      inBusinessHours: autoReply.inBusinessHours,
+      reactivationMinutes
+    });
+  } catch (err) {
+    console.error('[auto-reply] erro geral:', err);
+  }
+}
+
+
+app.get('/api/settings/auto-reply', async (req, res) => {
+  const settings = loadAutoReplySettings();
+  return res.status(200).json({
+    ok: true,
+    settings
+  });
+});
+
+app.post('/api/settings/auto-reply', async (req, res) => {
+  try {
+    const saved = saveAutoReplySettings(req.body || {});
+    return res.status(200).json({
+      ok: true,
+      settings: saved
+    });
+  } catch (err) {
+    console.error('Erro ao salvar auto-reply settings:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'failed_to_save_auto_reply_settings'
+    });
   }
 });
 

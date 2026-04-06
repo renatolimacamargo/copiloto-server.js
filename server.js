@@ -2135,6 +2135,171 @@ app.post('/evolution', async (req, res) => {
   }
 });
 
+
+function normalizeInboundMediaPayload(value) {
+  if (value == null) return null;
+  const str = String(value).trim();
+  if (!str) return null;
+  return str;
+}
+
+function extractPureBase64Media(value) {
+  const str = normalizeInboundMediaPayload(value);
+  if (!str) return null;
+
+  const match = str.match(/^data:.*?;base64,(.*)$/i);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+
+  return str;
+}
+
+function inferSendMediaType({ mediaType, mimetype, fileName }) {
+  const explicit = String(mediaType || '').trim().toLowerCase();
+  if (explicit === 'image' || explicit === 'video' || explicit === 'document') {
+    return explicit;
+  }
+
+  const mt = String(mimetype || '').trim().toLowerCase();
+  if (mt.startsWith('image/')) return 'image';
+  if (mt.startsWith('video/')) return 'video';
+
+  const fn = String(fileName || '').trim().toLowerCase();
+  if (/\.(png|jpe?g|webp|gif)$/i.test(fn)) return 'image';
+  if (/\.(mp4|mov|webm|mkv)$/i.test(fn)) return 'video';
+
+  return 'document';
+}
+
+app.post('/api/send-media', async (req, res) => {
+  try {
+    const {
+      chatId,
+      externalChatId,
+      number,
+      media,
+      base64,
+      fileData,
+      mimetype,
+      fileName,
+      caption,
+      mediaType,
+      quotedMessageId
+    } = req.body || {};
+
+    const rawPhone =
+      normalizePhone(externalChatId) ||
+      normalizePhone(number) ||
+      normalizePhone(chatId);
+
+    if (!rawPhone) {
+      return res.status(400).json({ error: 'invalid_chatId' });
+    }
+
+    const payloadMedia =
+      normalizeInboundMediaPayload(media) ||
+      normalizeInboundMediaPayload(base64) ||
+      normalizeInboundMediaPayload(fileData);
+
+    if (!payloadMedia) {
+      return res.status(400).json({ error: 'media_required' });
+    }
+
+    const normalizedMimeType = String(mimetype || '').trim() || 'application/octet-stream';
+    const normalizedFileName = String(fileName || '').trim() || 'arquivo';
+    const normalizedCaption = caption == null ? '' : String(caption);
+    const normalizedMediaType = inferSendMediaType({
+      mediaType,
+      mimetype: normalizedMimeType,
+      fileName: normalizedFileName
+    });
+
+    const pureMedia = extractPureBase64Media(payloadMedia);
+
+    const body = {
+      number: rawPhone,
+      mediatype: normalizedMediaType,
+      mimetype: normalizedMimeType,
+      caption: normalizedCaption,
+      media: pureMedia,
+      fileName: normalizedFileName
+    };
+
+    if (quotedMessageId) {
+      body.quoted = {
+        key: {
+          id: String(quotedMessageId).trim()
+        }
+      };
+    }
+
+    const response = await fetchWithTimeout(
+      `${EVOLUTION_BASE_URL}/message/sendMedia/${EVOLUTION_INSTANCE}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: EVOLUTION_API_KEY
+        },
+        body: JSON.stringify(body)
+      }
+    );
+
+    const raw = await response.text();
+    let data = null;
+
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = { raw };
+    }
+
+    if (!response.ok) {
+      console.error('Erro Evolution sendMedia:', {
+        status: response.status,
+        payload: {
+          number: rawPhone,
+          mediatype: normalizedMediaType,
+          mimetype: normalizedMimeType,
+          fileName: normalizedFileName,
+          hasCaption: !!normalizedCaption,
+          mediaLength: pureMedia ? pureMedia.length : 0
+        },
+        response: data
+      });
+
+      return res.status(response.status).json({
+        error: 'evolution_send_media_failed',
+        details: data
+      });
+    }
+
+    const evolutionMessageId = data?.key?.id || null;
+    const rawRemoteJid = data?.key?.remoteJid || `${rawPhone}@s.whatsapp.net`;
+    const altRemoteJid = data?.key?.remoteJidAlt || null;
+    const preferredRemoteJid = pickBestDirectJid(rawRemoteJid, altRemoteJid);
+
+    return res.status(200).json({
+      ok: true,
+      evolution_message_id: evolutionMessageId,
+      remote_jid: preferredRemoteJid,
+      raw_remote_jid: rawRemoteJid,
+      alt_remote_jid: altRemoteJid,
+      external_chat_id: rawPhone,
+      status: data?.status || null,
+      mediaType: normalizedMediaType,
+      fileName: normalizedFileName,
+      mimetype: normalizedMimeType,
+      mode: 'live_only'
+    });
+  } catch (err) {
+    console.error('Erro geral /api/send-media:', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
 const PORT = process.env.PORT || 3060;
 app.listen(PORT, () => {
   console.log(`🚀 Copiloto webhook rodando na porta ${PORT}`);
